@@ -1,73 +1,68 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+import os
+import shutil
 import subprocess
 import requests
-import os
-import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
 
-app = FastAPI()
+app = FastAPI(title="API FFmpeg Video Cutter")
 
-class CutRequest(BaseModel):
-    video_url: str
+class CutSegment(BaseModel):
     start_time: str
     end_time: str
+    output_name: Optional[str] = "corte.mp4"
 
-def remove_files(*file_paths):
-    """Função para limpar os arquivos temporários após o envio do vídeo."""
-    for path in file_paths:
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+class ProcessVideoRequest(BaseModel):
+    video_url: Optional[str] = None
+    file_path: Optional[str] = "/tmp/video_original.mp4"
+    segments: List[CutSegment]
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "API FFmpeg pronta para processar cortes!"}
 
 @app.post("/cut")
-def cut_video(data: CutRequest, background_tasks: BackgroundTasks):
-    request_id = str(uuid.uuid4())
-    input_file = f"input_{request_id}.mp4"
-    output_file = f"output_{request_id}.mp4"
+def cut_video(data: ProcessVideoRequest):
+    input_file = data.file_path
 
-    try:
-        # 1. Baixar o vídeo da URL
-        response = requests.get(data.video_url, stream=True)
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Erro ao baixar o vídeo da URL fornecida.")
+    # Se uma URL direta de MP4 for informada, faz o download para a pasta /tmp
+    if data.video_url and data.video_url.startswith("http"):
+        input_file = "/tmp/downloaded_video.mp4"
+        try:
+            response = requests.get(data.video_url, stream=True)
+            response.raise_for_status()
+            with open(input_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erro ao baixar o vídeo: {str(e)}")
+
+    if not os.path.exists(input_file):
+        raise HTTPException(status_code=404, detail=f"Arquivo de vídeo não encontrado em: {input_file}")
+
+    processed_files = []
+
+    for idx, segment in enumerate(data.segments):
+        output_filename = f"/tmp/corte_{idx + 1}.mp4"
         
-        with open(input_file, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024*1024):
-                f.write(chunk)
-
-        # 2. Fazer o corte ultra-rápido com FFmpeg
+        # Comando FFmpeg otimizado para corte rápido sem re-encoding pesado
         command = [
-            "ffmpeg",
-            "-ss", data.start_time,
-            "-to", data.end_time,
+            "ffmpeg", "-y",
+            "-ss", segment.start_time,
+            "-to", segment.end_time,
             "-i", input_file,
             "-c", "copy",
-            "-y",
-            output_file
+            output_filename
         ]
 
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            processed_files.append(output_filename)
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(status_code=500, detail=f"Erro ao cortar trecho {segment.start_time}-{segment.end_time}: {e.stderr.decode('utf-8')}")
 
-        if result.returncode != 0:
-            remove_files(input_file)
-            raise HTTPException(status_code=500, detail=f"Erro no FFmpeg: {result.stderr.decode()}")
-
-        # Clean up do arquivo de entrada imediatamente
-        remove_files(input_file)
-
-        # Agendar a exclusão do arquivo cortado APÓS ele ser enviado ao n8n
-        background_tasks.add_task(remove_files, output_file)
-
-        # 3. Retornar o arquivo MP4 diretamente para o n8n
-        return FileResponse(
-            path=output_file,
-            media_type="video/mp4",
-            filename=f"corte_{request_id}.mp4"
-        )
-
-    except Exception as e:
-        remove_files(input_file, output_file)
-        raise e
+    return {
+        "message": "Cortes realizados com sucesso!",
+        "files": processed_files
+    }
